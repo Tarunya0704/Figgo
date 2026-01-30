@@ -1,0 +1,399 @@
+// FIGGO PRO - Enhanced Schema with Component Registry & Sync Engine
+// This schema enables: Figma Node <-> Component <-> Code <-> Deployments traceability
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================================================
+// AUTHENTICATION & USER MANAGEMENT
+// ============================================================================
+
+model User {
+  id            String    @id @default(cuid())
+  email         String    @unique
+  name          String?
+  image         String?
+  emailVerified DateTime?
+
+  // Subscription
+  plan          String    @default("free") // free, pro, enterprise
+  projectsUsed  Int       @default(0)
+
+  // Relations
+  accounts      Account[]
+  sessions      Session[]
+  integrations  Integration[]
+  projects      Project[]
+  webhooks      FigmaWebhook[]
+
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+}
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.Text
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+}
+
+model Integration {
+  id           String    @id @default(cuid())
+  userId       String
+  provider     String    // figma, github, vercel
+  accessToken  String    @db.Text
+  refreshToken String?   @db.Text
+  expiresAt    DateTime?
+  scope        String?
+  metadata     Json?
+
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  @@unique([userId, provider])
+}
+
+// ============================================================================
+// PROJECT MANAGEMENT
+// ============================================================================
+
+model Project {
+  id              String   @id @default(cuid())
+  userId          String
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  name            String
+  description     String?
+
+  // Figma Source
+  figmaFileId     String
+  figmaFileKey    String   // The key from the Figma URL
+  figmaFileName   String?
+  figmaNodeId     String?  // Specific frame/node if not entire file
+  figmaDesignUrl  String?
+  figmaImageUrl   String?
+
+  // Generation Config
+  framework       String   @default("nextjs")
+  styling         String   @default("tailwind")
+
+  // Status
+  status          String   @default("pending")
+  progress        Int      @default(0)
+
+  // Quality Metrics
+  visualMatchScore  Int?
+  codeQualityScore  Int?
+  functionalScore   Int?
+
+  // Deployment
+  githubRepoUrl     String?
+  deploymentUrl     String?
+  vercelProjectId   String?
+
+  // Relations
+  components        Component[]
+  syncEvents        SyncEvent[]
+  deployments       Deployment[]
+
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([figmaFileId])
+  @@index([userId])
+}
+
+// ============================================================================
+// COMPONENT REGISTRY (THE MOAT)
+// Maps Figma Nodes <-> Generated Components <-> Code Files <-> Deployments
+// ============================================================================
+
+model Component {
+  id              String   @id @default(cuid())
+  projectId       String
+  project         Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  // Figma Reference
+  figmaNodeId     String   // Figma node ID (e.g., "1:23")
+  figmaNodeName   String   // Human-readable name from Figma
+  figmaNodeType   String   // FRAME, COMPONENT, INSTANCE, GROUP, etc.
+
+  // Generated Code Reference
+  componentName   String   // React component name (e.g., "ButtonPrimary")
+  filePath        String?  // Path in generated code (e.g., "components/ButtonPrimary.tsx")
+
+  // Design Tokens (Normalized)
+  designTokens    Json?    // { colors, typography, spacing, etc. }
+  tokenVersion    Int      @default(1)
+
+  // Sync Metadata
+  figmaLastModified DateTime?
+  codeLastGenerated DateTime?
+  syncStatus        String   @default("synced") // synced, outdated, conflict
+
+  // Tracking
+  changeFrequency   Int      @default(0)  // Number of times this component changed
+  impactRadius      Int      @default(0)  // Number of instances using this
+
+  // Relations
+  instances         ComponentInstance[]
+  tokenVersions     DesignTokenVersion[]
+  syncEvents        SyncEvent[]
+
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@unique([projectId, figmaNodeId])
+  @@index([figmaNodeId])
+}
+
+model ComponentInstance {
+  id            String    @id @default(cuid())
+  componentId   String
+  component     Component @relation(fields: [componentId], references: [id], onDelete: Cascade)
+
+  // Where this instance appears
+  filePath      String    // File where this component is used
+  lineNumber    Int?      // Line number in the file
+
+  // Instance-specific overrides
+  overrides     Json?     // Props or style overrides
+
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  @@index([componentId])
+}
+
+// ============================================================================
+// DESIGN TOKEN VERSIONING
+// Track all versions of design tokens for audit trail
+// ============================================================================
+
+model DesignTokenVersion {
+  id            String    @id @default(cuid())
+  componentId   String
+  component     Component @relation(fields: [componentId], references: [id], onDelete: Cascade)
+
+  version       Int
+  tokens        Json      // The actual token values at this version
+
+  // Change metadata
+  changedFields String[]  // Which fields changed (e.g., ["color.primary", "fontSize"])
+  changeType    String    // added, modified, removed
+  changeSource  String    // figma_webhook, manual, ai_generation
+
+  // Figma reference at this version
+  figmaVersion  String?   // Figma file version ID
+
+  createdAt     DateTime  @default(now())
+
+  @@unique([componentId, version])
+  @@index([componentId])
+}
+
+// ============================================================================
+// SYNC ENGINE
+// Tracks all sync events from Figma webhooks
+// ============================================================================
+
+model FigmaWebhook {
+  id            String   @id @default(cuid())
+  userId        String
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Webhook configuration
+  webhookId     String   @unique  // Figma's webhook ID
+  teamId        String            // Figma team ID
+  endpoint      String            // Our endpoint URL
+  passcode      String            // Webhook verification passcode
+
+  // Status
+  status        String   @default("active") // active, paused, error
+  lastPingAt    DateTime?
+  errorCount    Int      @default(0)
+  lastError     String?
+
+  // Event filtering
+  eventTypes    String[] // FILE_UPDATE, FILE_DELETE, LIBRARY_PUBLISH, etc.
+
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@index([teamId])
+}
+
+model SyncEvent {
+  id            String    @id @default(cuid())
+  projectId     String
+  project       Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  componentId   String?
+  component     Component? @relation(fields: [componentId], references: [id], onDelete: SetNull)
+
+  // Event Data
+  eventType     String    // FILE_UPDATE, COMPONENT_CHANGE, TOKEN_CHANGE, etc.
+  eventSource   String    // figma_webhook, manual_trigger, scheduled
+
+  // Figma Change Details
+  figmaEventId  String?   // Figma's event ID for deduplication
+  figmaVersion  String?   // Figma file version after change
+  figmaUserId   String?   // Who made the change in Figma
+
+  // Diff Information
+  diffSummary   Json?     // { added: [], modified: [], removed: [] }
+  semanticDiff  Json?     // What changed semantically (not just raw diff)
+
+  // Processing Status
+  status        String    @default("pending") // pending, processing, completed, failed
+  processedAt   DateTime?
+  errorMessage  String?
+
+  // Actions Taken
+  actionsTriggered Json?  // What actions were taken (PR created, notification sent, etc.)
+
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  @@index([projectId])
+  @@index([eventType])
+  @@index([status])
+}
+
+// ============================================================================
+// DEPLOYMENT TRACKING
+// Full traceability: Design -> Code -> PR -> Deploy
+// ============================================================================
+
+model Deployment {
+  id              String   @id @default(cuid())
+  projectId       String
+  project         Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  // Deployment Type
+  type            String   // preview, production
+  environment     String   @default("preview")
+
+  // Source
+  triggerType     String   // manual, sync_event, pr_merge
+  triggeredBy     String?  // User ID or "system"
+  syncEventId     String?  // Which sync event triggered this
+
+  // Git Reference
+  commitSha       String?
+  branch          String?
+  prNumber        Int?
+  prUrl           String?
+
+  // Deployment Status
+  status          String   @default("pending") // pending, building, deployed, failed, rolled_back
+  deploymentUrl   String?
+  previewUrl      String?
+
+  // Vercel/Platform Info
+  platformId      String?  // Vercel deployment ID
+  buildLogs       String?  @db.Text
+
+  // Visual Verification
+  screenshotUrl   String?
+  visualDiffScore Float?
+
+  // Approval
+  requiresApproval Boolean @default(true)
+  approvedBy       String?
+  approvedAt       DateTime?
+
+  // Rollback
+  rolledBackAt     DateTime?
+  rolledBackBy     String?
+  rollbackReason   String?
+
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([projectId])
+  @@index([status])
+}
+
+// ============================================================================
+// NOTIFICATION & AUDIT
+// ============================================================================
+
+model Notification {
+  id            String   @id @default(cuid())
+  userId        String
+
+  type          String   // design_change, sync_complete, deploy_ready, approval_needed
+  title         String
+  message       String
+
+  // Reference
+  projectId     String?
+  componentId   String?
+  deploymentId  String?
+
+  // Status
+  read          Boolean  @default(false)
+  actionUrl     String?
+
+  createdAt     DateTime @default(now())
+
+  @@index([userId])
+  @@index([read])
+}
+
+model AuditLog {
+  id            String   @id @default(cuid())
+  userId        String?
+
+  action        String   // webhook_received, component_synced, deployment_approved, etc.
+  entityType    String   // project, component, deployment, etc.
+  entityId      String
+
+  // Change Details
+  previousState Json?
+  newState      Json?
+
+  // Context
+  ipAddress     String?
+  userAgent     String?
+
+  createdAt     DateTime @default(now())
+
+  @@index([entityType, entityId])
+  @@index([action])
+}
