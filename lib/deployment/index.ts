@@ -36,37 +36,49 @@ export interface DeploymentResult {
 export async function deployProject(
   config: DeploymentConfig
 ): Promise<DeploymentResult> {
-  // Get user's integrations
-  const githubIntegration = await prisma.integration.findUnique({
-    where: {
-      userId_provider: {
-        userId: config.userId,
-        provider: "github",
+  // Get user's integrations (per-user OAuth tokens)
+  const [githubIntegration, vercelIntegration] = await Promise.all([
+    prisma.integration.findUnique({
+      where: {
+        userId_provider: {
+          userId: config.userId,
+          provider: "github",
+        },
       },
-    },
-  });
-
-  const vercelToken = process.env.VERCEL_TOKEN;
-  const vercelTeamId = process.env.VERCEL_TEAM_ID;
+    }),
+    prisma.integration.findUnique({
+      where: {
+        userId_provider: {
+          userId: config.userId,
+          provider: "vercel",
+        },
+      },
+    }),
+  ]);
 
   if (!githubIntegration) {
-    return { success: false, error: "GitHub not connected" };
+    return { success: false, error: "GitHub not connected. Please connect your GitHub account in Settings." };
   }
 
-  if (!vercelToken) {
-    return { success: false, error: "Vercel not configured" };
+  if (!vercelIntegration) {
+    return { success: false, error: "Vercel not connected. Please connect your Vercel account in Settings." };
   }
 
-  // Get GitHub username
+  // Get GitHub username from stored metadata
   const githubMetadata = githubIntegration.metadata as any;
   const githubUsername = githubMetadata?.login || githubMetadata?.username;
 
   if (!githubUsername) {
-    return { success: false, error: "GitHub username not found" };
+    return { success: false, error: "GitHub username not found. Please reconnect your GitHub account." };
   }
 
+  // Get Vercel team ID if available (user might be deploying to a team)
+  const vercelMetadata = vercelIntegration.metadata as any;
+  const vercelTeamId = vercelMetadata?.team_id;
+
+  // Initialize services with per-user tokens
   const github = new GitHubService(githubIntegration.accessToken, githubUsername);
-  const vercel = new VercelService(vercelToken, vercelTeamId);
+  const vercel = new VercelService(vercelIntegration.accessToken, vercelTeamId);
 
   const repoName = config.projectName
     .toLowerCase()
@@ -263,15 +275,25 @@ export async function rollbackDeployment(
     return { success: false, error: "Unauthorized" };
   }
 
-  const vercelToken = process.env.VERCEL_TOKEN;
-  const vercelTeamId = process.env.VERCEL_TEAM_ID;
+  // Get user's Vercel integration (per-user token)
+  const vercelIntegration = await prisma.integration.findUnique({
+    where: {
+      userId_provider: {
+        userId,
+        provider: "vercel",
+      },
+    },
+  });
 
-  if (!vercelToken || !deployment.project.vercelProjectId) {
-    return { success: false, error: "Vercel not configured" };
+  if (!vercelIntegration || !deployment.project.vercelProjectId) {
+    return { success: false, error: "Vercel not connected" };
   }
 
+  const vercelMetadata = vercelIntegration.metadata as any;
+  const vercelTeamId = vercelMetadata?.team_id;
+
   try {
-    const vercel = new VercelService(vercelToken, vercelTeamId);
+    const vercel = new VercelService(vercelIntegration.accessToken, vercelTeamId);
 
     // Get previous successful production deployment
     const deployments = await vercel.listDeployments(
